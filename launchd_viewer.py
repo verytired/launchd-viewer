@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """launchd configuration viewer - macOS launchd services visualizer"""
 
+import hashlib
 import json
 import os
 import plistlib
+import re
 import subprocess
+import threading
+import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-import tempfile
 import signal
 import sys
-import urllib.parse
+
+HOME = os.path.expanduser("~")
+MONITORED = ("User Agents", "Global Agents", "Global Daemons")
+BASELINE_PATH = Path(__file__).resolve().parent / "baseline.json"
+MONITOR_INTERVAL = 10  # seconds
+SUSPICIOUS_DIRS = ("/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/Users/Shared/", "/dev/shm/")
+INTERPRETERS = {"sh", "bash", "zsh", "dash", "env", "python", "python3", "perl", "ruby", "osascript", "node", "php"}
+BAD_PATTERNS = {"curl": r"\bcurl\b", "wget": r"\bwget\b", "base64": r"base64", "| sh": r"\|\s*(ba|z)?sh\b",
+                "eval": r"\beval\b", "nc": r"\bnc\b", "/dev/tcp": r"/dev/tcp/", "chmod +x": r"\bchmod\s+\+x",
+                "xattr -d": r"\bxattr\s+-d"}
+MACHO_MAGIC = {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}
 
 PLIST_DIRS = {
     "User Agents": os.path.expanduser("~/Library/LaunchAgents"),
@@ -55,10 +68,151 @@ def parse_plist(filepath):
     return None
 
 
+_cache = {}
+
+
+def cached(fn, path):
+    """Memoize fn(path) on (fn, path, mtime, size) so 5s refreshes stay cheap."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (fn.__name__, path, st.st_mtime, st.st_size)
+    if key not in _cache:
+        _cache[key] = fn(path)
+    return _cache[key]
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def is_macho(path):
+    with open(path, "rb") as f:
+        return f.read(4) in MACHO_MAGIC
+
+
+def signer(path):
+    """'unsigned' / 'adhoc' / first Authority (e.g. 'Software Signing', 'Developer ID Application: ...')."""
+    out = subprocess.run(["codesign", "-dv", "--verbose=2", path], capture_output=True, text=True).stderr
+    if "not signed" in out:
+        return "unsigned"
+    for line in out.splitlines():
+        if line.startswith("Authority="):
+            return line.split("=", 1)[1]
+    return "adhoc" if "Signature=adhoc" in out else "unknown"
+
+
+def plist_args(plist):
+    if not plist:
+        return []
+    args = [str(plist["Program"])] if plist.get("Program") else []
+    return args + [str(a) for a in plist.get("ProgramArguments") or []]
+
+
+def exec_target(args):
+    """The file actually run: the script for `bash script.sh`, else the program itself."""
+    if not args:
+        return None
+    if os.path.basename(args[0]) in INTERPRETERS:
+        for a in args[1:]:
+            if not a.startswith("-") and os.path.isfile(a):
+                return a
+    return args[0]
+
+
+def snapshot():
+    """{plist path: {plist hash, exec target, target hash}} for the monitored dirs."""
+    snap = {}
+    for cat in MONITORED:
+        d = PLIST_DIRS[cat]
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if not fn.endswith(".plist"):
+                continue
+            p = os.path.join(d, fn)
+            target = exec_target(plist_args(parse_plist(p)))
+            snap[p] = {"plist": cached(file_hash, p), "target": target,
+                       "targetHash": cached(file_hash, target) if target and os.path.isfile(target) else None}
+    return snap
+
+
+def load_baseline():
+    try:
+        return json.loads(BASELINE_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_baseline(snap):
+    BASELINE_PATH.write_text(json.dumps(snap, indent=1))
+
+
+def assess(plist, filepath, label, args, snap_entry, base_entry):
+    """Heuristic red flags: list of (severity 1-3, message)."""
+    flags = []
+    if plist is None:
+        flags.append((2, "plist を解析できない"))
+    program = args[0] if args else None
+    if program and program.startswith("/") and not os.path.exists(program):
+        flags.append((2, f"実行ファイルが存在しない: {program}"))
+    target = exec_target(args)
+    for a in args:
+        run = a == target  # the executed file is what matters; other args (sockets, data) only hint
+        if a.startswith(SUSPICIOUS_DIRS):
+            flags.append((3 if run else 1, f"一時/共有ディレクトリ{'から実行' if run else 'のパスを引数に'}: {a}"))
+        elif a.startswith("/") and re.search(r"/\.[^/.]", a):
+            flags.append((2 if run else 1, f"隠しディレクトリ{'から実行' if run else 'のパスを引数に'}: {a}"))
+    cmd = " ".join(args)
+    hits = [name for name, pat in BAD_PATTERNS.items() if re.search(pat, cmd, re.I)]
+    if hits:
+        flags.append((3, "危険なコマンド断片: " + ", ".join(hits)))
+    elif program and os.path.basename(program) in INTERPRETERS and any(a in ("-c", "-e") for a in args[1:]):
+        flags.append((2, "インタプリタにインラインコードを渡している"))
+
+    sig = None
+    if program and os.path.isfile(program) and cached(is_macho, program):
+        sig = cached(signer, program)
+        if sig in ("unsigned", "adhoc"):
+            flags.append((2, f"署名なしバイナリ ({sig})"))
+    if label.startswith("com.apple.") and not ("Software Signing" in (sig or "") or (sig or "").startswith("Apple")):
+        flags.append((3, "com.apple.* を名乗るが Apple 署名ではない"))
+
+    stem = os.path.basename(filepath)[:-len(".plist")]
+    if plist and plist.get("Label") and plist["Label"] != stem:
+        flags.append((1, f"Label とファイル名が不一致 ({stem}.plist)"))
+    st = os.stat(filepath)
+    if not filepath.startswith(HOME) and st.st_uid != 0:
+        flags.append((2, "/Library 配下なのに所有者が root でない"))
+    if st.st_mode & 0o022:
+        flags.append((2, "plist が group/other から書き込み可能"))
+    if time.time() - st.st_mtime < 7 * 86400:
+        flags.append((1, "7日以内に変更された"))
+
+    if base_entry is None:
+        flags.append((2, "ベースラインにない新規 plist"))
+    else:
+        if base_entry.get("plist") != snap_entry["plist"]:
+            flags.append((2, "plist の内容がベースラインから変更"))
+        if base_entry.get("target") != snap_entry["target"] or base_entry.get("targetHash") != snap_entry["targetHash"]:
+            flags.append((3, f"実行ファイルがベースラインから変更: {snap_entry['target']}"))
+    return flags, sig
+
+
 def collect_data():
     """Collect all launchd data."""
     running = get_launchctl_list()
     services = []
+    snap = snapshot()
+    baseline = load_baseline()
+    if baseline is None:  # first run: current state becomes the baseline
+        save_baseline(snap)
+        baseline = snap
 
     for category, dirpath in PLIST_DIRS.items():
         if not os.path.isdir(dirpath):
@@ -106,7 +260,16 @@ def collect_data():
             if disabled:
                 state = "disabled"
 
+            flags, sig = [], None
+            if category in MONITORED:
+                flags, sig = assess(plist, filepath, label, plist_args(plist),
+                                    snap.get(filepath, {}), baseline.get(filepath))
+            flags.sort(reverse=True)
+
             services.append({
+                "risk": max((f[0] for f in flags), default=0),
+                "flags": [f[1] for f in flags],
+                "signer": sig,
                 "label": label,
                 "category": category,
                 "state": state,
@@ -126,7 +289,36 @@ def collect_data():
     cron_jobs = collect_cron()
     services.extend(cron_jobs)
 
-    return services
+    removed = sorted(p for p in baseline if p not in snap)
+    return {"services": services, "removed": removed}
+
+
+def notify(msg):
+    subprocess.run(["osascript", "-e", "on run argv", "-e",
+                    'display notification (item 1 of argv) with title "launchd Viewer" sound name "Basso"',
+                    "-e", "end run", msg], capture_output=True)
+
+
+def monitor_loop():
+    """Background watch: macOS notification when a risky/changed item or removal first appears."""
+    seen = None
+    while True:
+        try:
+            data = collect_data()
+            snap = snapshot()
+            current = {(s["plistPath"], json.dumps(snap.get(s["plistPath"])), f): s["label"]
+                       for s in data["services"] if s.get("risk", 0) >= 2 for f in s["flags"]}
+            current.update({("removed", p, ""): p for p in data["removed"]})
+            if seen is not None:
+                fresh = [k for k in current if k not in seen]
+                for key in fresh[:5]:
+                    notify(f"{current[key]}: {key[2] or 'plist が削除された'}")
+                if len(fresh) > 5:
+                    notify(f"他 {len(fresh) - 5} 件の警告")
+            seen = current
+        except Exception as e:
+            print(f"monitor error: {e}", file=sys.stderr)
+        time.sleep(MONITOR_INTERVAL)
 
 
 def collect_cron():
@@ -223,10 +415,6 @@ def action_delete_cron(cron_line):
     return {"ok": False, "message": p.stderr.strip() or "Failed to update crontab"}
 
 
-# Global reference to generated HTML
-generated_html = ""
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress access logs
@@ -270,6 +458,9 @@ class Handler(BaseHTTPRequestHandler):
             result = action_delete_cron(cron_line)
         elif action == "delete_plist":
             result = action_delete_plist(label, plist_path)
+        elif action == "accept_baseline":
+            save_baseline(snapshot())
+            result = {"ok": True, "message": "現在の状態をベースラインとして保存しました"}
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -323,6 +514,13 @@ td.actions-cell { white-space: nowrap; }
 .badge.cat-global { background: #1c2a3f; color: #58a6ff; }
 .badge.cat-system { background: #1f2d1f; color: #56d364; }
 .badge.cat-cron { background: #2d2a1f; color: #e3b341; }
+.badge.risk3 { background: #5a1d24; color: #ff7b72; }
+.badge.risk2 { background: #3d2e1a; color: #e3b341; }
+.badge.risk1 { background: #1c1e21; color: #8b949e; }
+.stat.suspicious .num { color: #ff7b72; }
+.alerts { margin: 12px 24px 0; padding: 10px 14px; border: 1px solid #f8514966; background: #2a1417; border-radius: 8px; font-size: 13px; }
+.alerts ul { margin: 6px 0 0 20px; font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+.flag3 { color: #ff7b72; } .flag2 { color: #e3b341; } .flag1 { color: #8b949e; }
 .check { color: #3fb950; }
 .cross { color: #484f58; }
 .detail-row td { white-space: normal; word-break: break-all; background: #0d1117; padding: 12px 16px; font-size: 12px; }
@@ -391,13 +589,18 @@ td.actions-cell { white-space: nowrap; }
   <label style="font-size:13px;color:#8b949e;display:flex;align-items:center;gap:4px;">
     <input type="checkbox" id="hideSystem" checked> Hide System
   </label>
+  <label style="font-size:13px;color:#ff7b72;display:flex;align-items:center;gap:4px;">
+    <input type="checkbox" id="suspOnly"> Suspicious only
+  </label>
 </div>
+ <div id="alerts"></div>
 <div class="main">
   <div class="count-info" id="countInfo"></div>
   <table>
     <thead>
       <tr>
         <th class="no-sort">Actions</th>
+        <th data-col="risk">Risk <span class="arrow">&#9660;</span></th>
         <th data-col="state">State <span class="arrow"></span></th>
         <th data-col="category">Category <span class="arrow"></span></th>
         <th data-col="label">Label <span class="arrow"></span></th>
@@ -414,10 +617,14 @@ td.actions-cell { white-space: nowrap; }
 <div id="modalContainer"></div>
 <div id="toastContainer"></div>
 <script>
-let DATA = __DATA__;
+let DATA = __DATA__.services;
+let REMOVED = __DATA__.removed;
+let suspOnly = false;
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const RISK = ["", "low", "medium", "high"];
 
-let sortCol = "label";
-let sortAsc = true;
+let sortCol = "risk";
+let sortAsc = false;
 let stateFilter = "";
 let catFilter = "";
 let searchQuery = "";
@@ -466,7 +673,8 @@ async function apiAction(body) {
 
 async function refreshData() {
   const res = await fetch("/api/refresh");
-  DATA = await res.json();
+  const d = await res.json();
+  DATA = d.services; REMOVED = d.removed;
   renderStats();
   render();
 }
@@ -481,19 +689,19 @@ function handleAction(e) {
   if (!s) return;
 
   if (action === "stop") {
-    showModal("Stop Service", `<code>${s.label}</code> を停止しますか？`, () => {
+    showModal("Stop Service", `<code>${esc(s.label)}</code> を停止しますか？`, () => {
       apiAction({ action: "stop", label: s.label, plistPath: s.plistPath });
     });
   } else if (action === "start") {
-    showModal("Start Service", `<code>${s.label}</code> を起動しますか？`, () => {
+    showModal("Start Service", `<code>${esc(s.label)}</code> を起動しますか？`, () => {
       apiAction({ action: "start", label: s.label, plistPath: s.plistPath });
     }, "ok");
   } else if (action === "delete_cron") {
-    showModal("Delete Cron Job", `このcronエントリを削除しますか？<br><code>${s.cronLine || ''}</code>`, () => {
+    showModal("Delete Cron Job", `このcronエントリを削除しますか？<br><code>${esc(s.cronLine)}</code>`, () => {
       apiAction({ action: "delete_cron", cronLine: s.cronLine });
     });
   } else if (action === "delete_plist") {
-    showModal("Delete Plist", `<code>${s.plistPath}</code><br><br>このplistファイルを削除しますか？サービスは先に停止されます。この操作は取り消せません。`, () => {
+    showModal("Delete Plist", `<code>${esc(s.plistPath)}</code><br><br>このplistファイルを削除しますか？サービスは先に停止されます。この操作は取り消せません。`, () => {
       apiAction({ action: "delete_plist", label: s.label, plistPath: s.plistPath });
     });
   }
@@ -506,12 +714,24 @@ function renderStats() {
     `<div class="stat"><span class="num">${DATA.length}</span> Total</div>` +
     Object.entries(counts).map(([k, v]) =>
       `<div class="stat ${k}"><span class="num">${v}</span> ${k.charAt(0).toUpperCase() + k.slice(1)}</div>`
-    ).join("");
+    ).join("") +
+    `<div class="stat suspicious"><span class="num">${DATA.filter(s => s.risk >= 2).length}</span> Suspicious</div>`;
+  const diff = DATA.filter(s => (s.flags || []).some(f => f.includes("ベースライン")));
+  const el = document.getElementById("alerts");
+  if (!diff.length && !REMOVED.length) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="alerts"><b>ベースラインとの差分</b>（新規・変更 ${diff.length} / 削除 ${REMOVED.length}）
+    <button class="act-btn start" id="acceptBtn" style="margin-left:8px">現状をベースラインとして承認</button>
+    <ul>${diff.map(s => `<li>${esc(s.label)} — ${esc(s.flags.filter(f => f.includes("ベースライン")).join(" / "))}</li>`).join("")}
+    ${REMOVED.map(p => `<li>削除: ${esc(p)}</li>`).join("")}</ul></div>`;
+  document.getElementById("acceptBtn").onclick = () => showModal("Accept Baseline",
+    "現在の plist と実行ファイルの状態を正常としてベースラインに保存します。差分の中身を確認してから承認してください。",
+    () => apiAction({ action: "accept_baseline" }), "ok");
 }
 
 function filtered() {
   return DATA.filter(s => {
-    if (hideApple && s.label.startsWith("com.apple.")) return false;
+    if (suspOnly && !(s.risk >= 2)) return false;
+    if (hideApple && s.label.startsWith("com.apple.") && !(s.risk >= 2)) return false;
     if (hideSystem && (s.category === "System Agents" || s.category === "System Daemons")) return false;
     if (stateFilter && s.state !== stateFilter) return false;
     if (catFilter && s.category !== catFilter) return false;
@@ -558,26 +778,29 @@ function render() {
   let html = "";
   for (let i = 0; i < list.length; i++) {
     const s = list[i];
-    html += `<tr class="svc-row" data-label="${s.label}">
+    html += `<tr class="svc-row" data-label="${esc(s.label)}">
       <td class="actions-cell">${actionButtons(s, i)}</td>
+      <td>${s.risk ? `<span class="badge risk${s.risk}" title="${esc((s.flags || []).join("\\n"))}">${RISK[s.risk]}</span>` : '<span class="cross">-</span>'}</td>
       <td><span class="badge ${s.state}">${s.state}</span></td>
-      <td><span class="badge ${catClass(s.category)}">${s.category}</span></td>
-      <td class="label-cell">${s.label}</td>
+      <td><span class="badge ${catClass(s.category)}">${esc(s.category)}</span></td>
+      <td class="label-cell">${esc(s.label)}</td>
       <td>${s.pid != null ? s.pid : "-"}</td>
       <td>${s.exitStatus != null ? s.exitStatus : "-"}</td>
       <td>${s.runAtLoad ? '<span class="check">&#10003;</span>' : '<span class="cross">-</span>'}</td>
       <td>${s.keepAlive ? '<span class="check">&#10003;</span>' : '<span class="cross">-</span>'}</td>
-      <td class="program-cell" title="${s.program || ''}">${s.program || "-"}</td>
+      <td class="program-cell" title="${esc(s.program)}">${esc(s.program || "-")}</td>
     </tr>`;
     if (expandedLabel === s.label) {
-      html += `<tr class="detail-row"><td colspan="9"><dl class="detail-content">
-        <dt>Plist Path</dt><dd>${s.plistPath}</dd>
-        <dt>Program</dt><dd>${s.program || "N/A"}</dd>
-        ${s.keepAliveDetail ? `<dt>KeepAlive Detail</dt><dd>${s.keepAliveDetail}</dd>` : ""}
-        ${s.startInterval ? `<dt>StartInterval</dt><dd>${s.startInterval}s</dd>` : ""}
-        ${s.startCalendar ? `<dt>StartCalendarInterval</dt><dd>${s.startCalendar}</dd>` : ""}
-        ${s.watchPaths ? `<dt>WatchPaths</dt><dd>${JSON.stringify(s.watchPaths)}</dd>` : ""}
-        ${s.cronLine ? `<dt>Cron Line</dt><dd>${s.cronLine}</dd>` : ""}
+      html += `<tr class="detail-row"><td colspan="10"><dl class="detail-content">
+        ${(s.flags || []).length ? `<dt>Red flags</dt>${s.flags.map(f => `<dd class="flag${s.risk}">• ${esc(f)}</dd>`).join("")}` : ""}
+        ${s.signer ? `<dt>Code Signature</dt><dd>${esc(s.signer)}</dd>` : ""}
+        <dt>Plist Path</dt><dd>${esc(s.plistPath)}</dd>
+        <dt>Program</dt><dd>${esc(s.program || "N/A")}</dd>
+        ${s.keepAliveDetail ? `<dt>KeepAlive Detail</dt><dd>${esc(s.keepAliveDetail)}</dd>` : ""}
+        ${s.startInterval ? `<dt>StartInterval</dt><dd>${esc(s.startInterval)}s</dd>` : ""}
+        ${s.startCalendar ? `<dt>StartCalendarInterval</dt><dd>${esc(s.startCalendar)}</dd>` : ""}
+        ${s.watchPaths ? `<dt>WatchPaths</dt><dd>${esc(JSON.stringify(s.watchPaths))}</dd>` : ""}
+        ${s.cronLine ? `<dt>Cron Line</dt><dd>${esc(s.cronLine)}</dd>` : ""}
       </dl></td></tr>`;
     }
   }
@@ -585,6 +808,7 @@ function render() {
 }
 
 document.getElementById("hideApple").addEventListener("change", e => { hideApple = e.target.checked; render(); });
+document.getElementById("suspOnly").addEventListener("change", e => { suspOnly = e.target.checked; render(); });
 document.getElementById("hideSystem").addEventListener("change", e => { hideSystem = e.target.checked; render(); });
 document.getElementById("search").addEventListener("input", e => { searchQuery = e.target.value; render(); });
 document.getElementById("categoryFilter").addEventListener("change", e => { catFilter = e.target.value; render(); });
@@ -622,9 +846,9 @@ async function autoRefresh() {
   if (!autoRefreshEnabled) return;
   try {
     const res = await fetch("/api/refresh");
-    const newData = await res.json();
-    const changed = JSON.stringify(newData) !== JSON.stringify(DATA);
-    DATA = newData;
+    const d = await res.json();
+    const changed = JSON.stringify(d) !== JSON.stringify({services: DATA, removed: REMOVED});
+    DATA = d.services; REMOVED = d.removed;
     if (changed) { renderStats(); render(); }
     const now = new Date();
     document.getElementById("updateIndicator").textContent = `Updated ${now.toLocaleTimeString()}`;
@@ -654,12 +878,11 @@ autoRefresh();
 PORT = 8745
 
 def main():
-    global generated_html
     print("Collecting launchd data...")
-    services = collect_data()
-    print(f"Found {len(services)} services")
-
-    generated_html = HTML_TEMPLATE.replace("__DATA__", json.dumps(services, ensure_ascii=False))
+    data = collect_data()
+    print(f"Found {len(data['services'])} services, "
+          f"{sum(s.get('risk', 0) >= 2 for s in data['services'])} suspicious (baseline: {BASELINE_PATH})")
+    threading.Thread(target=monitor_loop, daemon=True).start()
 
     def handler(sig, frame):
         print("\nShutting down...")
